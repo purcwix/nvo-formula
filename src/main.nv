@@ -1,154 +1,601 @@
-// semver.nv - Semantic Versioning library for Nova
+// ════════════════════════════════════════════════════════════════════════
+//  formula.nv — A small formula/expression language: lexer + parser + AST
+//  evaluator, written entirely in Nova, powered by Std.Lexer for tokenizing.
+//
+//  Supports:
+//    numbers, strings, booleans, null
+//    arithmetic:   + - * / % ^            (^ is exponent, right-assoc)
+//    comparison:   == != < > <= >=
+//    logical:      && || !                (also spelled: and / or / not)
+//    ternary:      cond ? a : b
+//    grouping:     ( expr )
+//    arrays:       [1, 2, 3]
+//    objects:      { key: expr, "key2": expr }
+//    indexing:     arr[0]     obj["key"]
+//    property:     obj.prop
+//    method call:  obj.method(a, b)        — dispatches through Nova's own
+//                                             runtime, so real string/array
+//                                             methods (toUpperCase, slice,
+//                                             map, join, ...) work for free
+//    function call: NAME(a, b, ...)
+//    builtins:     SUM AVERAGE MIN MAX ABS ROUND FLOOR CEIL SQRT POW
+//                  IF AND OR NOT CONCAT LEN UPPER LOWER TRIM
+//
+//  Usage:
+//    let Formula = Std.include("formula.nv");
+//
+//    let r = Formula.run("SUM(1, 2, x.y, [3, 4]) + 1", { x: { y: 4 } });
+//    if r.ok { Std.println(r.value); } else { Std.println(r.error); }
+//
+//    let p = Formula.parse("user.tags[0].toUpperCase()");
+//    if p.ok { Std.println(Formula.describe(p.ast)); }
+// ════════════════════════════════════════════════════════════════════════
 
-function parseSemver(str) {
-    if str == null { return null; }
+// ── lexer ──────────────────────────────────────────────────────────────────
 
-    // split build metadata first
-    let buildMeta = "";
-    let plusIdx = str.indexOf("+");
-    if plusIdx != -1 {
-        buildMeta = str.slice(plusIdx + 1);
-        str = str.slice(0, plusIdx);
-    }
+let formulaLexer = Std.Lexer.new({
+    lineComment: "//",
+    quotes: [
+        { type: "string", open: "\"", close: "\"", escape: "\\" },
+        { type: "string", open: "'",  close: "'",  escape: "\\" }
+    ],
+    rules: [
+        { type: "number",     pattern: "\\d+\\.\\d+|\\d+" },
+        { type: "identifier", pattern: "[A-Za-z_][A-Za-z0-9_]*" },
+        { type: "operator",   pattern: "==|!=|<=|>=|&&|\\|\\||[+\\-*/%^<>=!?:.,()\\[\\]{}]" }
+    ]
+});
 
-    // split pre-release
-    let pre = "";
-    let dashIdx = str.indexOf("-");
-    if dashIdx != -1 {
-        pre = str.slice(dashIdx + 1);
-        str = str.slice(0, dashIdx);
-    }
-
-    // split major.minor.patch
-    let parts = str.split(".");
-    if parts.length != 3 { return null; }
-
-    let major = Std.number(parts[0]);
-    let minor = Std.number(parts[1]);
-    let _patch = Std.number(parts[2]);
-
-    if major != major { return null; } // NaN check
-    if minor != minor { return null; }
-    if _patch != _patch { return null; }
-
-    return {
-        major: major,
-        minor: minor,
-        patch: _patch,
-        pre: pre,
-        build: buildMeta,
-    };
+function tokenize(source) {
+    return formulaLexer.tokenize(source);
 }
 
-function validSemver(str) {
-    return parseSemver(str) != null;
+// ── AST node constructors (plain objects, kept small & inspectable) ────────
+
+function nNum(v) { return { type: "Num", value: v }; }
+function nStr(v) { return { type: "Str", value: v }; }
+function nBool(v) { return { type: "Bool", value: v }; }
+function nNull() { return { type: "Null" }; }
+function nIdent(name) { return { type: "Ident", name: name }; }
+function nArray(items) { return { type: "Array", items: items }; }
+function nObject(props) { return { type: "Object", props: props }; }
+function nUnary(op, operand) { return { type: "Unary", op: op, operand: operand }; }
+function nBinary(op, left, right) { return { type: "Binary", op: op, left: left, right: right }; }
+function nTernary(cond, thenExpr, elseExpr) { return { type: "Ternary", cond: cond, then: thenExpr, else: elseExpr }; }
+function nProp(obj, name) { return { type: "Prop", obj: obj, name: name }; }
+function nIndex(obj, idx) { return { type: "Index", obj: obj, idx: idx }; }
+function nCall(callee, args) { return { type: "Call", callee: callee, args: args }; }
+
+// ── parser (recursive descent, precedence-climbing) ────────────────────────
+
+class Parser {
+    constructor(tokens) {
+        this.tokens = tokens;
+        this.pos = 0;
+    }
+
+    peek() { return this.tokens[this.pos]; }
+    atEnd() { return this.peek().type == "eof"; }
+
+    advance() {
+        let t = this.peek();
+        if !this.atEnd() { this.pos = this.pos + 1; }
+        return t;
+    }
+
+    isVal(v) { return !this.atEnd() && this.peek().value == v; }
+
+    matchVal(v) {
+        if this.isVal(v) { return this.advance(); }
+        return null;
+    }
+
+    expectVal(v) {
+        if !this.isVal(v) {
+            let got = this.atEnd() ? "<end>" : this.peek().value;
+            Std.error("Formula parse error: expected '" + v + "' but got '" + got + "'");
+        }
+        return this.advance();
+    }
+
+    parse() {
+        if this.atEnd() { Std.error("Formula parse error: empty expression"); }
+        let node = this.ternary();
+        if !this.atEnd() {
+            Std.error("Formula parse error: unexpected token '" + this.peek().value + "'");
+        }
+        return node;
+    }
+
+    // cond ? then : else
+    ternary() {
+        let cond = this.logicOr();
+        if this.matchVal("?") {
+            let thenExpr = this.ternary();
+            this.expectVal(":");
+            let elseExpr = this.ternary();
+            return nTernary(cond, thenExpr, elseExpr);
+        }
+        return cond;
+    }
+
+    logicOr() {
+        let left = this.logicAnd();
+        while this.isVal("||") || this.isVal("or") {
+            this.advance();
+            let right = this.logicAnd();
+            left = nBinary("||", left, right);
+        }
+        return left;
+    }
+
+    logicAnd() {
+        let left = this.equality();
+        while this.isVal("&&") || this.isVal("and") {
+            this.advance();
+            let right = this.equality();
+            left = nBinary("&&", left, right);
+        }
+        return left;
+    }
+
+    equality() {
+        let left = this.comparison();
+        while this.isVal("==") || this.isVal("!=") {
+            let op = this.advance().value;
+            let right = this.comparison();
+            left = nBinary(op, left, right);
+        }
+        return left;
+    }
+
+    comparison() {
+        let left = this.additive();
+        while this.isVal("<") || this.isVal(">") || this.isVal("<=") || this.isVal(">=") {
+            let op = this.advance().value;
+            let right = this.additive();
+            left = nBinary(op, left, right);
+        }
+        return left;
+    }
+
+    additive() {
+        let left = this.multiplicative();
+        while this.isVal("+") || this.isVal("-") {
+            let op = this.advance().value;
+            let right = this.multiplicative();
+            left = nBinary(op, left, right);
+        }
+        return left;
+    }
+
+    multiplicative() {
+        let left = this.unary();
+        while this.isVal("*") || this.isVal("/") || this.isVal("%") {
+            let op = this.advance().value;
+            let right = this.unary();
+            left = nBinary(op, left, right);
+        }
+        return left;
+    }
+
+    unary() {
+        if this.isVal("-") || this.isVal("+") || this.isVal("!") || this.isVal("not") {
+            let op = this.advance().value;
+            let operand = this.unary();
+            if op == "+" { return operand; }
+            let realOp = (op == "not") ? "!" : op;
+            return nUnary(realOp, operand);
+        }
+        return this.power();
+    }
+
+    // right-associative exponent: 2^3^2 == 2^(3^2)
+    power() {
+        let base = this.postfix();
+        if this.isVal("^") {
+            this.advance();
+            let exp = this.unary();
+            return nBinary("^", base, exp);
+        }
+        return base;
+    }
+
+    postfix() {
+        let node = this.primary();
+        while true {
+            if this.isVal(".") {
+                this.advance();
+                let name = this.advance().value;
+                node = nProp(node, name);
+            } else if this.isVal("[") {
+                this.advance();
+                let idx = this.ternary();
+                this.expectVal("]");
+                node = nIndex(node, idx);
+            } else if this.isVal("(") {
+                this.advance();
+                let args = this.argList();
+                this.expectVal(")");
+                node = nCall(node, args);
+            } else {
+                break;
+            }
+        }
+        return node;
+    }
+
+    argList() {
+        let args = [];
+        if !this.isVal(")") {
+            args.push(this.ternary());
+            while this.matchVal(",") {
+                args.push(this.ternary());
+            }
+        }
+        return args;
+    }
+
+    primary() {
+        let t = this.peek();
+
+        if t.type == "number" {
+            this.advance();
+            return nNum(Std.number(t.value));
+        }
+        if t.type == "string" {
+            this.advance();
+            return nStr(t.value);
+        }
+        if t.value == "(" {
+            this.advance();
+            let inner = this.ternary();
+            this.expectVal(")");
+            return inner;
+        }
+        if t.value == "[" {
+            this.advance();
+            let items = [];
+            if !this.isVal("]") {
+                items.push(this.ternary());
+                while this.matchVal(",") {
+                    items.push(this.ternary());
+                }
+            }
+            this.expectVal("]");
+            return nArray(items);
+        }
+        if t.value == "{" {
+            this.advance();
+            let props = [];
+            if !this.isVal("}") {
+                props.push(this.objectProp());
+                while this.matchVal(",") {
+                    props.push(this.objectProp());
+                }
+            }
+            this.expectVal("}");
+            return nObject(props);
+        }
+        if t.type == "identifier" || t.type == "keyword" {
+            this.advance();
+            if t.value == "true" { return nBool(true); }
+            if t.value == "false" { return nBool(false); }
+            if t.value == "null" { return nNull(); }
+            return nIdent(t.value);
+        }
+
+        Std.error("Formula parse error: unexpected token '" + t.value + "'");
+        return nNull();
+    }
+
+    objectProp() {
+        let t = this.advance();
+        let key = t.value;
+        this.expectVal(":");
+        let value = this.ternary();
+        return { key: key, value: value };
+    }
 }
 
-function compareSemver(a, b) {
-    let pa = parseSemver(a);
-    let pb = parseSemver(b);
-    if pa == null or pb == null { return null; }
-
-    if pa.major != pb.major {
-        return pa.major > pb.major ? 1 : -1;
-    }
-    if pa.minor != pb.minor {
-        return pa.minor > pb.minor ? 1 : -1;
-    }
-    if pa.patch != pb.patch {
-        return pa.patch > pb.patch ? 1 : -1;
-    }
-
-    // both have no pre-release or same pre-release
-    if pa.pre == "" and pb.pre == "" { return 0; }
-    // no pre-release > has pre-release
-    if pa.pre == "" and pb.pre != "" { return 1; }
-    if pa.pre != "" and pb.pre == "" { return -1; }
-    // compare pre-release lexically
-    if pa.pre > pb.pre { return 1; }
-    if pa.pre < pb.pre { return -1; }
-    return 0;
+function parseOrThrow(source) {
+    let tokens = tokenize(source);
+    let p = Parser(tokens);
+    return p.parse();
 }
 
-function bumpSemver(str, kind) {
-    let p = parseSemver(str);
-    if p == null { return null; }
+function parse(source) {
+    try {
+        let ast = parseOrThrow(source);
+        return { ok: true, ast: ast, error: null };
+    } catch e {
+        return { ok: false, ast: null, error: Std.string(e) };
+    }
+}
 
-    if kind == "major" {
-        return f"{p.major + 1}.0.0";
+// ── evaluator helpers ───────────────────────────────────────────────────────
+
+function truthy(v) {
+    if v == null { return false; }
+    if Std.typeof(v) == "bool" { return v; }
+    if Std.typeof(v) == "number" { return v != 0; }
+    if Std.typeof(v) == "string" { return v.length > 0; }
+    return true;
+}
+
+function flattenArgs(args) {
+    // lets SUM(1, 2, [3,4], 5) treat arrays as spread-in values
+    let out = [];
+    each a of args {
+        if Std.typeof(a) == "array" {
+            each v of a { out.push(v); }
+        } else {
+            out.push(a);
+        }
     }
-    if kind == "minor" {
-        return f"{p.major}.{p.minor + 1}.0";
+    return out;
+}
+
+// ── builtin function table ─────────────────────────────────────────────────
+
+let builtins = {
+    SUM: args => {
+        let vals = flattenArgs(args);
+        let total = 0;
+        each v of vals { total = total + v; }
+        return total;
+    },
+    AVERAGE: args => {
+        let vals = flattenArgs(args);
+        if vals.length == 0 { return 0; }
+        let total = 0;
+        each v of vals { total = total + v; }
+        return total / vals.length;
+    },
+    MIN: args => {
+        let vals = flattenArgs(args);
+        if vals.length == 0 { return null; }
+        let m = vals[0];
+        each v of vals { if v < m { m = v; } }
+        return m;
+    },
+    MAX: args => {
+        let vals = flattenArgs(args);
+        if vals.length == 0 { return null; }
+        let m = vals[0];
+        each v of vals { if v > m { m = v; } }
+        return m;
+    },
+    ABS:   args => Std.Math.abs(args[0]),
+    ROUND: args => Std.Math.round(args[0]),
+    FLOOR: args => Std.Math.floor(args[0]),
+    CEIL:  args => Std.Math.ceil(args[0]),
+    SQRT:  args => Std.Math.sqrt(args[0]),
+    POW:   args => Std.Math.pow(args[0], args[1]),
+    IF:    args => truthy(args[0]) ? args[1] : args[2],
+    AND: args => {
+        each v of args { if !truthy(v) { return false; } }
+        return true;
+    },
+    OR: args => {
+        each v of args { if truthy(v) { return true; } }
+        return false;
+    },
+    NOT: args => !truthy(args[0]),
+    CONCAT: args => {
+        let s = "";
+        each v of args { s = s + Std.string(v); }
+        return s;
+    },
+    LEN: args => {
+        let v = args[0];
+        if Std.typeof(v) == "array" { return v.length; }
+        return Std.string(v).length;
+    },
+    UPPER: args => Std.string(args[0]).toUpperCase(),
+    LOWER: args => Std.string(args[0]).toLowerCase(),
+    TRIM:  args => Std.string(args[0]).trim()
+};
+
+// ── evaluator ────────────────────────────────────────────────────────────
+
+function evalArgs(argNodes, ctx) {
+    let out = [];
+    each a of argNodes { out.push(evalNode(a, ctx)); }
+    return out;
+}
+
+function evalBinary(op, node, ctx) {
+    if op == "&&" {
+        let l = evalNode(node.left, ctx);
+        if !truthy(l) { return l; }
+        return evalNode(node.right, ctx);
     }
-    if kind == "patch" {
-        return f"{p.major}.{p.minor}.{p.patch + 1}";
+    if op == "||" {
+        let l = evalNode(node.left, ctx);
+        if truthy(l) { return l; }
+        return evalNode(node.right, ctx);
     }
+
+    let l = evalNode(node.left, ctx);
+    let r = evalNode(node.right, ctx);
+
+    if op == "+" {
+        if Std.typeof(l) == "string" || Std.typeof(r) == "string" {
+            return Std.string(l) + Std.string(r);
+        }
+        return l + r;
+    }
+    if op == "-" { return l - r; }
+    if op == "*" { return l * r; }
+    if op == "/" { return l / r; }
+    if op == "%" { return l % r; }
+    if op == "^" { return Std.Math.pow(l, r); }
+    if op == "==" { return l == r; }
+    if op == "!=" { return l != r; }
+    if op == "<" { return l < r; }
+    if op == ">" { return l > r; }
+    if op == "<=" { return l <= r; }
+    if op == ">=" { return l >= r; }
+
+    Std.error("Formula error: unknown operator '" + op + "'");
     return null;
 }
 
-function stringifySemver(p) {
-    if p == null { return null; }
-    let base = f"{p.major}.{p.minor}.{p.patch}";
-    if p.pre != "" { base = base + "-" + p.pre; }
-    if p.build != "" { base = base + "+" + p.build; }
-    return base;
+function evalCall(node, ctx) {
+    let callee = node.callee;
+
+    // obj.method(args) — dispatch through real Nova method values, so
+    // string/array/object built-in methods work without us reimplementing them.
+    if callee.type == "Prop" {
+        let obj = evalNode(callee.obj, ctx);
+        if obj == null { Std.error("Formula error: cannot call method '" + callee.name + "' on null"); }
+        let fn = obj[callee.name];
+        if fn == null || Std.typeof(fn) != "function" {
+            Std.error("Formula error: '" + callee.name + "' is not a function");
+        }
+        let args = evalArgs(node.args, ctx);
+        return fn(...args);
+    }
+
+    if callee.type == "Ident" {
+        let name = callee.name;
+        let args = evalArgs(node.args, ctx);
+
+        if Std.isDefined(builtins[name]) {
+            return builtins[name](args);
+        }
+        if ctx != null && Std.isDefined(ctx[name]) && Std.typeof(ctx[name]) == "function" {
+            return ctx[name](...args);
+        }
+        Std.error("Formula error: unknown function '" + name + "'");
+    }
+
+    // generic case: computed callee expression
+    let fn = evalNode(callee, ctx);
+    let args = evalArgs(node.args, ctx);
+    return fn(...args);
 }
 
-function satisfiesSemver(str, range) {
-    let p = parseSemver(str);
-    if p == null { return false; }
+function evalNode(node, ctx) {
+    let t = node.type;
 
-    // strip leading whitespace
-    range = range.trim();
+    if t == "Num" { return node.value; }
+    if t == "Str" { return node.value; }
+    if t == "Bool" { return node.value; }
+    if t == "Null" { return null; }
 
-    // caret ^ — compatible with version (same major)
-    if range.startsWith("^") {
-        let rp = parseSemver(range.slice(1));
-        if rp == null { return false; }
-        if p.major != rp.major { return false; }
-        return compareSemver(str, range.slice(1)) >= 0;
-    }
-
-    // tilde ~ — patch level compatible (same major.minor)
-    if range.startsWith("~") {
-        let rp = parseSemver(range.slice(1));
-        if rp == null { return false; }
-        if p.major != rp.major { return false; }
-        if p.minor != rp.minor { return false; }
-        return compareSemver(str, range.slice(1)) >= 0;
+    if t == "Array" {
+        let out = [];
+        each item of node.items { out.push(evalNode(item, ctx)); }
+        return out;
     }
 
-    // >= <= > < =
-    if range.startsWith(">=") {
-        return compareSemver(str, range.slice(2)) >= 0;
-    }
-    if range.startsWith("<=") {
-        return compareSemver(str, range.slice(2)) <= 0;
-    }
-    if range.startsWith(">") {
-        return compareSemver(str, range.slice(1)) > 0;
-    }
-    if range.startsWith("<") {
-        return compareSemver(str, range.slice(1)) < 0;
-    }
-    if range.startsWith("=") {
-        return compareSemver(str, range.slice(1)) == 0;
+    if t == "Object" {
+        let obj = {};
+        each p of node.props { obj[p.key] = evalNode(p.value, ctx); }
+        return obj;
     }
 
-    // exact match
-    return compareSemver(str, range) == 0;
+    if t == "Ident" {
+        let name = node.name;
+        if ctx != null && Std.isDefined(ctx[name]) { return ctx[name]; }
+        if Std.isDefined(builtins[name]) { return builtins[name]; }
+        Std.error("Formula error: unknown identifier '" + name + "'");
+    }
+
+    if t == "Unary" {
+        let v = evalNode(node.operand, ctx);
+        if node.op == "-" { return 0 - v; }
+        if node.op == "!" { return !truthy(v); }
+        return v;
+    }
+
+    if t == "Binary" { return evalBinary(node.op, node, ctx); }
+
+    if t == "Ternary" {
+        let c = evalNode(node.cond, ctx);
+        return truthy(c) ? evalNode(node.then, ctx) : evalNode(node.else, ctx);
+    }
+
+    if t == "Prop" {
+        let obj = evalNode(node.obj, ctx);
+        if obj == null { Std.error("Formula error: cannot read property '" + node.name + "' of null"); }
+        return obj[node.name];
+    }
+
+    if t == "Index" {
+        let obj = evalNode(node.obj, ctx);
+        let idx = evalNode(node.idx, ctx);
+        if obj == null { Std.error("Formula error: cannot index into null"); }
+        return obj[idx];
+    }
+
+    if t == "Call" { return evalCall(node, ctx); }
+
+    Std.error("Formula error: unknown node type '" + t + "'");
+    return null;
 }
 
-let semver = {
-    parse: parseSemver,
-    valid: validSemver,
-    compare: compareSemver,
-    gt(a, b) { return compareSemver(a, b) > 0; },
-    lt(a, b) { return compareSemver(a, b) < 0; },
-    eq(a, b) { return compareSemver(a, b) == 0; },
-    bump: bumpSemver,
-    stringify: stringifySemver,
-    satisfies: satisfiesSemver,
+function evaluate(ast, context) {
+    let ctx = context == null ? {} : context;
+    return evalNode(ast, ctx);
+}
+
+function exec(source, context) {
+    try {
+        let ast = parseOrThrow(source);
+        let value = evaluate(ast, context);
+        return { ok: true, value: value, error: null };
+    } catch e {
+        return { ok: false, value: null, error: Std.string(e) };
+    }
+}
+
+// ── debug / pretty printer ──────────────────────────────────────────────────
+
+function describe(node) {
+    if node == null { return "null"; }
+    let t = node.type;
+
+    if t == "Num" { return Std.string(node.value); }
+    if t == "Str" { return "\"" + node.value + "\""; }
+    if t == "Bool" { return Std.string(node.value); }
+    if t == "Null" { return "null"; }
+    if t == "Ident" { return node.name; }
+    if t == "Unary" { return "(" + node.op + describe(node.operand) + ")"; }
+    if t == "Binary" { return "(" + describe(node.left) + " " + node.op + " " + describe(node.right) + ")"; }
+    if t == "Ternary" { return "(" + describe(node.cond) + " ? " + describe(node.then) + " : " + describe(node.else) + ")"; }
+    if t == "Prop" { return describe(node.obj) + "." + node.name; }
+    if t == "Index" { return describe(node.obj) + "[" + describe(node.idx) + "]"; }
+    if t == "Array" {
+        let parts = [];
+        each it of node.items { parts.push(describe(it)); }
+        return "[" + parts.join(", ") + "]";
+    }
+    if t == "Object" {
+        let parts = [];
+        each p of node.props { parts.push(p.key + ": " + describe(p.value)); }
+        return "{" + parts.join(", ") + "}";
+    }
+    if t == "Call" {
+        let parts = [];
+        each a of node.args { parts.push(describe(a)); }
+        return describe(node.callee) + "(" + parts.join(", ") + ")";
+    }
+    return "<?" + t + "?>";
+}
+
+// ── exports ──────────────────────────────────────────────────────────────
+
+let Formula = {
+    tokenize: tokenize,
+    parse: parse,
+    parseOrThrow: parseOrThrow,
+    evaluate: evaluate,
+    run: exec,
+    describe: describe,
+    builtins: builtins
 };
 
-export semver;
+export Formula;

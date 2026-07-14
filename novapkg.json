@@ -1,7 +1,7 @@
 {
-  "name": "nvo-semver",
-  "version": "1.0.0",
-  "description": "NVO-NovaOfficial: Official semver library",
+  "name": "nvo-formula",
+  "version": "1.0.1",
+  "description": "NVO-NovaOfficial: Official nova formula package",
   "author": "purcwix",
   "license": "MIT",
   "main": "src/main.nv",
